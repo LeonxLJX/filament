@@ -19,9 +19,22 @@
 
 #include "vulkan/memory/ResourcePointer.h"
 
+#include <bluevk/BlueVK.h>
+
+#include <utils/bitset.h>
+#include <utils/compiler.h>
+#include <utils/Mutex.h>
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+
 namespace filament::backend {
 
+struct VulkanCmdFence;
 struct VulkanCommandBuffer;
+struct VulkanContext;
 struct VulkanTimerQuery;
 
 class VulkanQueryManager {
@@ -33,15 +46,15 @@ public:
         uint64_t endAvailable = 0;
     };
 
-    VulkanQueryManager(VkDevice device);
-    ~VulkanQueryManager() = default;
+    VulkanQueryManager(VulkanContext const& context, VkDevice device);
+    ~VulkanQueryManager();
 
     // Not copy-able.
     VulkanQueryManager(VulkanQueryManager const&) = delete;
     VulkanQueryManager& operator=(VulkanQueryManager const&) = delete;
 
     fvkmemory::resource_ptr<VulkanTimerQuery>
-            getNextQuery(fvkmemory::ResourceManager* mResourceManager);
+            getNextQuery(fvkmemory::ResourceManager* resourceManager);
     void clearQuery(fvkmemory::resource_ptr<VulkanTimerQuery> query);
     void beginQuery(VulkanCommandBuffer const* commands,
             fvkmemory::resource_ptr<VulkanTimerQuery> query);
@@ -52,12 +65,28 @@ public:
     void terminate() noexcept;
 
 private:
+    static constexpr size_t MAX_TIMERS = 32;
+    static constexpr uint32_t QUERY_COUNT = MAX_TIMERS * 2;
+
     VkDevice mDevice;
-    VkQueryPool mPool;
-    utils::bitset32 mUsed;
+    VkQueryPool mPool = VK_NULL_HANDLE;
+    bool const mHostQueryReset;
+
+    // Besides guarding the members below, mMutex serializes vkResetQueryPoolEXT (backend thread)
+    // against vkGetQueryPoolResults (main thread), as required by
+    // VUID-vkResetQueryPool-firstQuery-02742.
     utils::Mutex mMutex;
+    utils::bitset32 mUsed UTILS_GUARDED_BY(mMutex);
+    // Tracks the completion fence of endQuery for each slot; read by getResult() on the main
+    // thread under mMutex, and modified only on the backend thread under mMutex.
+    std::array<std::shared_ptr<VulkanCmdFence>, MAX_TIMERS> mCompletedFences
+            UTILS_GUARDED_BY(mMutex);
+
+    // Accessed exclusively on the backend thread to verify GPU idle state before host reset.
+    utils::bitset32 mNeedsReset;
+    std::array<std::shared_ptr<VulkanCmdFence>, MAX_TIMERS> mLastFences;
 };
 
-} // filament::backend
+} // namespace filament::backend
 
 #endif // TNT_FILAMENT_BACKEND_VULKANQUERYMANAGER_H

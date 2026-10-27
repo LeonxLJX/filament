@@ -58,4 +58,112 @@ TEST_F(BackendTest, TimerQueryPoolExhaustion) {
     flushAndWait();
 }
 
+// Exercises repeated timer query reuse across completed frames (which uses host-side reset via
+// VK_EXT_host_query_reset when supported) and verifies that beginning a new measurement clears
+// readiness until the new command buffer completes.
+TEST_F(BackendTest, TimerQueryReuseAcrossFrames) {
+    auto& api = getDriverApi();
+    if (!api.isFrameTimeSupported()) {
+        GTEST_SKIP() << "Timer queries are not supported on this backend.";
+    }
+
+    auto swapChain = addCleanup(createSwapChain());
+    auto defaultRt = addCleanup(api.createDefaultRenderTarget());
+    Handle<HwTimerQuery> q = api.createTimerQuery();
+    ASSERT_TRUE(bool(q));
+
+    uint64_t elapsed = 0;
+    EXPECT_EQ(api.getTimerQueryValue(q, &elapsed), TimerQueryResult::NOT_READY);
+
+    constexpr uint32_t kFrameCount = 6;
+    for (uint32_t frame = 1; frame <= kFrameCount; ++frame) {
+        api.makeCurrent(swapChain, swapChain);
+        api.beginFrame(0, 0, frame);
+        api.beginTimerQuery(q);
+
+        if (matchesEnvironment(Backend::VULKAN)) {
+            // Once beginTimerQuery executes on the backend, a previously completed result must no
+            // longer be reported while the new measurement is still recording.
+            executeCommands();
+            EXPECT_EQ(api.getTimerQueryValue(q, &elapsed), TimerQueryResult::NOT_READY);
+        }
+
+        RenderPassParams params = getClearColorDepthRenderPass();
+        params.viewport = getFullViewport();
+        api.beginRenderPass(defaultRt, params);
+        api.endRenderPass();
+
+        api.endTimerQuery(q);
+        api.commit(swapChain);
+        api.endFrame(frame);
+
+        api.finish();
+        api.tick();
+        executeCommands();
+        getDriver().purge();
+
+        TimerQueryResult const r = api.getTimerQueryValue(q, &elapsed);
+        if (matchesEnvironment(Backend::VULKAN)) {
+            // Completed Vulkan queries must have availability bits set; drivers with coarse
+            // timestamps (begin == end) report ERROR rather than NOT_READY.
+            EXPECT_NE(r, TimerQueryResult::NOT_READY);
+            // Querying a second time before the next beginTimerQuery must remain idempotent.
+            uint64_t elapsedAgain = 0;
+            EXPECT_EQ(api.getTimerQueryValue(q, &elapsedAgain), r);
+        }
+    }
+
+    api.destroyTimerQuery(q);
+    flushAndWait();
+}
+
+// Exercises back-to-back query reuse and destroy/recreate slot reuse before GPU work completes
+// (covering the device-side vkCmdResetQueryPool fallback when a slot is still in flight) followed
+// by post-completion reuse (covering host-side vkResetQueryPoolEXT).
+TEST_F(BackendTest, TimerQueryInFlightAndSlotReuse) {
+    auto& api = getDriverApi();
+    if (!api.isFrameTimeSupported()) {
+        GTEST_SKIP() << "Timer queries are not supported on this backend.";
+    }
+
+    Handle<HwTimerQuery> q1 = api.createTimerQuery();
+    ASSERT_TRUE(bool(q1));
+
+    // Reuse the same query handle twice in the same command buffer, and again across a flush
+    // without waiting for GPU completion.
+    api.beginTimerQuery(q1);
+    api.endTimerQuery(q1);
+    api.beginTimerQuery(q1);
+    api.endTimerQuery(q1);
+    api.flush();
+    api.beginTimerQuery(q1);
+    api.endTimerQuery(q1);
+
+    // Destroy q1 while its command buffers are still in flight, then allocate q2 (which reclaims
+    // the freed pool slot) and record another query before waiting.
+    api.destroyTimerQuery(q1);
+    executeCommands();
+
+    Handle<HwTimerQuery> q2 = api.createTimerQuery();
+    ASSERT_TRUE(bool(q2));
+    uint64_t elapsed = 0;
+    EXPECT_EQ(api.getTimerQueryValue(q2, &elapsed), TimerQueryResult::NOT_READY);
+
+    api.beginTimerQuery(q2);
+    api.endTimerQuery(q2);
+    flushAndWait();
+
+    // Now that the slot is idle on the GPU, reuse q2 once more to exercise host-side reset.
+    api.beginTimerQuery(q2);
+    api.endTimerQuery(q2);
+    flushAndWait();
+
+    if (matchesEnvironment(Backend::VULKAN)) {
+        EXPECT_NE(api.getTimerQueryValue(q2, &elapsed), TimerQueryResult::NOT_READY);
+    }
+
+    api.destroyTimerQuery(q2);
+    flushAndWait();
+}
+
 } // namespace test
